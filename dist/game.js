@@ -32,7 +32,7 @@ var SnakeGame = (() => {
   var FP_2PI = 411775;
   var FP_HALF_PI = 102944;
   function toFixed(f) {
-    return Math.round(f * FP_ONE) | 0;
+    return Math.round(f * FP_ONE);
   }
   function toFloat(fp) {
     return fp / FP_ONE;
@@ -84,29 +84,7 @@ var SnakeGame = (() => {
     return Number(x);
   }
   function dSqrt(x) {
-    if (x <= 0)
-      return 0;
-    const scaled = BigInt(Math.round(x * FP_ONE)) * BigInt(FP_ONE);
-    let bitLen = 0n;
-    let temp = scaled;
-    while (temp > 0n) {
-      bitLen++;
-      temp >>= 1n;
-    }
-    let r = 1n << (bitLen >> 1n);
-    let prevR = 0n;
-    for (let i = 0; i < 30; i++) {
-      const rNew = r + scaled / r >> 1n;
-      if (rNew === r || rNew === prevR)
-        break;
-      prevR = r;
-      r = rNew;
-    }
-    while (r * r > scaled)
-      r--;
-    while ((r + 1n) * (r + 1n) <= scaled)
-      r++;
-    return Number(r) / FP_ONE;
+    return toFloat(fpSqrt(toFixed(x)));
   }
   var SIN_TABLE_SIZE = 256;
   var SIN_TABLE = [
@@ -779,10 +757,6 @@ var SnakeGame = (() => {
     damping: 0,
     isSensor: false
   });
-  Body2D.AccessorClass.prototype.setVelocity = function(vx, vy) {
-    this.vx = vx;
-    this.vy = vy;
-  };
   var Player = defineComponent("Player", {
     clientId: 0
     // Interned clientId string
@@ -1039,33 +1013,6 @@ var SnakeGame = (() => {
       const dy = toFixed(target.y) - toFixed(transform.y);
       const distSq = fpMul(dx, dx) + fpMul(dy, dy);
       if (distSq === 0) {
-        body.vx = 0;
-        body.vy = 0;
-        return;
-      }
-      const dist = fpSqrt(distSq);
-      const speedFp = toFixed(speed * 60);
-      body.vx = toFloat(fpDiv(fpMul(dx, speedFp), dist));
-      body.vy = toFloat(fpDiv(fpMul(dy, speedFp), dist));
-    }
-    /**
-     * Set velocity toward a target, but stop if within radius.
-     *
-     * @param target Target position {x, y}
-     * @param speed Speed in units per second
-     * @param stopRadius Stop moving when within this distance (default: 0)
-     */
-    moveTowardsWithStop(target, speed, stopRadius = 0) {
-      if (!this.has(Transform2D) || !this.has(Body2D))
-        return;
-      const transform = this.get(Transform2D);
-      const body = this.get(Body2D);
-      const dx = toFixed(target.x) - toFixed(transform.x);
-      const dy = toFixed(target.y) - toFixed(transform.y);
-      const distSq = fpMul(dx, dx) + fpMul(dy, dy);
-      const stopRadiusFp = toFixed(stopRadius);
-      const stopRadiusSq = fpMul(stopRadiusFp, stopRadiusFp);
-      if (distSq <= stopRadiusSq) {
         body.vx = 0;
         body.vy = 0;
         return;
@@ -2800,14 +2747,13 @@ var SnakeGame = (() => {
      */
     handleLocalInput(input2) {
       if (this.localClientId === null) {
-        console.error("[modu] Cannot handle local input: localClientId not set. Ensure game.connect() completed before processing input.");
+        console.warn("Cannot handle local input: localClientId not set");
         return;
       }
       const entity = this.getEntityByClientId(this.localClientId);
       if (entity) {
         entity._setInputData(input2);
       }
-      this.inputRegistry.set(this.localClientId, input2);
       this.inputHistory.setInput(this.frame, this.localClientId, input2);
       this.predictions.push({
         frame: this.frame,
@@ -3205,6 +3151,15 @@ var SnakeGame = (() => {
         matchingFieldCount: 0,
         totalFieldCount: 0
       };
+      /** Divergence tracking */
+      this.lastSyncPercent = 100;
+      this.firstDivergenceFrame = null;
+      this.divergenceHistory = [];
+      this.recentInputs = [];
+      this.lastServerSnapshot = { raw: null, decoded: null, frame: 0 };
+      this.lastGoodSnapshot = null;
+      this.divergenceCaptured = false;
+      this.divergenceCapture = null;
       /** Tick timing for render interpolation */
       this.lastTickTime = 0;
       this.tickIntervalMs = 50;
@@ -3479,8 +3434,6 @@ var SnakeGame = (() => {
           }
         });
         this.localClientIdStr = this.connection.clientId;
-        if (this.localClientIdStr)
-          this.world.localClientId = this.internClientId(this.localClientIdStr);
       } catch (err) {
         console.warn("[ecs] Connection failed:", err?.message || err);
         this.connection = null;
@@ -3506,7 +3459,6 @@ var SnakeGame = (() => {
         }
       }
       this.localClientIdStr = clientId;
-      this.world.localClientId = this.internClientId(clientId);
       this.serverFps = fps;
       this.tickIntervalMs = 1e3 / fps;
       this.currentFrame = frame;
@@ -3539,15 +3491,17 @@ var SnakeGame = (() => {
         const isPostTick = snapshot.postTick === true;
         const startFrame = isPostTick ? snapshotFrame + 1 : snapshotFrame;
         const ticksToRun = frame - startFrame + 1;
-        const snapshotSizeKB = (snapshotSize / 1024).toFixed(2);
-        console.log(`[ecs] Loaded snapshot: ${snapshotSizeKB} KB, ${ticksToRun} frames behind`);
-        console.log(`[ecs] Applying ${pendingInputs.length} inputs to catch up`);
         if (DEBUG_NETWORK) {
           console.log(`[ecs] Catchup: from ${startFrame} to ${frame} (${ticksToRun} ticks), ${pendingInputs.length} pending inputs`);
         }
         if (ticksToRun > 0) {
           this.runCatchup(startFrame, frame, pendingInputs);
         }
+        this.lastGoodSnapshot = {
+          snapshot: JSON.parse(JSON.stringify(snapshot)),
+          frame: this.currentFrame,
+          hash: this.getStateHash()
+        };
       } else {
         if (DEBUG_NETWORK)
           console.log("[ecs] First join: creating room");
@@ -3607,6 +3561,15 @@ var SnakeGame = (() => {
       }
       const clientId = data?.clientId || input2.clientId;
       const type = data?.type;
+      this.recentInputs.push({
+        frame: this.currentFrame,
+        seq: input2.seq,
+        clientId,
+        data: JSON.parse(JSON.stringify(data))
+      });
+      if (this.recentInputs.length > 500) {
+        this.recentInputs.shift();
+      }
       if (input2.seq > this.lastInputSeq) {
         this.lastInputSeq = input2.seq;
       }
@@ -3980,9 +3943,12 @@ var SnakeGame = (() => {
               console.warn(`[ecs] DRIFT detected at frame ${serverSnapshot.frame}: local=${localHash}, server=${serverHash}`);
             }
           } else {
-            if (DEBUG_NETWORK) {
-              console.log(`[ecs] Snapshot frame ${serverSnapshot.frame} != current ${this.currentFrame}, skipping comparison`);
-            }
+            this.driftStats = {
+              determinismPercent: 100,
+              totalChecks: 0,
+              matchingFieldCount: 0,
+              totalFieldCount: 0
+            };
           }
         }
       } catch (e) {
@@ -3993,9 +3959,11 @@ var SnakeGame = (() => {
      * Compare server snapshot fields with local state for drift tracking.
      */
     compareSnapshotFields(serverSnapshot) {
+      const frame = serverSnapshot.frame;
       let matchingFields = 0;
       let totalFields = 0;
       const diffs = [];
+      this.lastServerSnapshot = { raw: null, decoded: serverSnapshot, frame };
       const types = serverSnapshot.types || [];
       const serverEntities = serverSnapshot.entities || [];
       const schema = serverSnapshot.schema || [];
@@ -4010,18 +3978,16 @@ var SnakeGame = (() => {
         if (!serverEntity) {
           for (const comp of entity.getComponents()) {
             totalFields += comp.fieldNames.length;
-          }
-          if (diffs.length < 10) {
-            diffs.push(`Entity ${eid.toString(16)} (${entity.type}) exists locally but not on server`);
+            for (const fieldName of comp.fieldNames) {
+              diffs.push({ entity: entity.type, eid, comp: comp.name, field: fieldName, local: "EXISTS", server: "MISSING" });
+            }
           }
           continue;
         }
         const [, typeIndex, serverValues] = serverEntity;
-        const serverType = types[typeIndex];
         const typeSchema = schema[typeIndex];
-        if (!typeSchema) {
+        if (!typeSchema)
           continue;
-        }
         let valueIdx = 0;
         for (const [compName, fieldNames] of typeSchema) {
           const localComp = entity.getComponents().find((c) => c.name === compName);
@@ -4041,8 +4007,8 @@ var SnakeGame = (() => {
               }
               if (valuesMatch) {
                 matchingFields++;
-              } else if (diffs.length < 10) {
-                diffs.push(`${entity.type}.${compName}.${fieldName}: local=${localValue}, server=${serverValue}`);
+              } else {
+                diffs.push({ entity: entity.type, eid, comp: compName, field: fieldName, local: localValue, server: serverValue });
               }
             }
           }
@@ -4053,21 +4019,126 @@ var SnakeGame = (() => {
           const [, typeIndex, serverValues] = serverEntity;
           const serverType = types[typeIndex] || `type${typeIndex}`;
           totalFields += serverValues.length;
-          if (diffs.length < 10) {
-            diffs.push(`Entity ${eid.toString(16)} (${serverType}) exists on server but not locally`);
-          }
+          diffs.push({ entity: serverType, eid, comp: "*", field: "*", local: "MISSING", server: "EXISTS" });
         }
       }
+      const newPercent = totalFields > 0 ? matchingFields / totalFields * 100 : 100;
+      const wasSync = this.lastSyncPercent === 100;
+      const isSync = newPercent === 100;
+      if (isSync) {
+        this.lastGoodSnapshot = {
+          snapshot: JSON.parse(JSON.stringify(serverSnapshot)),
+          frame,
+          hash: this.getStateHash()
+        };
+      }
+      if (wasSync && !isSync && !this.divergenceCaptured) {
+        this.firstDivergenceFrame = frame;
+        this.divergenceHistory = [];
+        this.divergenceCaptured = true;
+        const lastGoodFrame = this.lastGoodSnapshot?.frame ?? 0;
+        const inputsInRange = this.recentInputs.filter((i) => i.frame > lastGoodFrame && i.frame <= frame);
+        const localSnapshot = this.world.getState();
+        this.divergenceCapture = {
+          lastGoodSnapshot: this.lastGoodSnapshot?.snapshot ?? null,
+          lastGoodFrame,
+          inputs: inputsInRange,
+          localSnapshot,
+          serverSnapshot,
+          diffs,
+          divergenceFrame: frame,
+          clientId: this.localClientIdStr,
+          isAuthority: this.checkIsAuthority()
+        };
+        this.showDivergenceDiff(diffs, inputsInRange, frame);
+      }
+      this.lastSyncPercent = newPercent;
       this.driftStats.totalChecks++;
       this.driftStats.matchingFieldCount = matchingFields;
       this.driftStats.totalFieldCount = totalFields;
-      this.driftStats.determinismPercent = totalFields > 0 ? matchingFields / totalFields * 100 : 100;
-      if (diffs.length > 0 && this.driftStats.determinismPercent < 100) {
-        console.warn(`[ecs] Sync ${matchingFields}/${totalFields} (${this.driftStats.determinismPercent.toFixed(1)}%):`);
-        for (const diff of diffs) {
-          console.warn(`  - ${diff}`);
+      this.driftStats.determinismPercent = newPercent;
+      if (diffs.length > 0 && newPercent < 100 && this.divergenceCaptured && frame % 60 === 0) {
+        console.warn(`[DIVERGENCE] Frame ${frame}: still diverged (${newPercent.toFixed(1)}% sync, first at ${this.firstDivergenceFrame})`);
+      }
+    }
+    /**
+     * Show divergence debug data (auto-called on first divergence).
+     */
+    showDivergenceDiff(diffs, inputs, frame) {
+      const lines = [];
+      const lastGoodFrame = this.lastGoodSnapshot?.frame ?? 0;
+      const myClientId = this.localClientIdStr || "";
+      const clientIds = /* @__PURE__ */ new Set();
+      for (const input2 of inputs) {
+        clientIds.add(input2.clientId);
+      }
+      const clientList = Array.from(clientIds);
+      const clientLabels = /* @__PURE__ */ new Map();
+      clientList.forEach((cid, i) => {
+        const label = cid === myClientId ? "ME" : `P${i + 1}`;
+        clientLabels.set(cid, label);
+      });
+      const entityOwners = /* @__PURE__ */ new Map();
+      for (const entity of this.world.getAllEntities()) {
+        if (entity.has(Player)) {
+          const playerData = entity.get(Player);
+          const ownerClientId = this.numToClientId.get(playerData.clientId);
+          if (ownerClientId) {
+            entityOwners.set(entity.eid, clientLabels.get(ownerClientId) || ownerClientId.slice(0, 8));
+          }
         }
       }
+      lines.push(`=== DIVERGENCE DEBUG DATA ===`);
+      lines.push(`Frame: ${frame} | Last good: ${lastGoodFrame} | Authority: ${this.checkIsAuthority()}`);
+      lines.push(`Clients: ${clientList.map((cid) => `${clientLabels.get(cid)}=${cid.slice(0, 8)}`).join(", ")}`);
+      lines.push(``);
+      lines.push(`DIVERGENT FIELDS (${diffs.length}):`);
+      for (const d of diffs) {
+        const delta = typeof d.local === "number" && typeof d.server === "number" ? ` \u0394${d.local - d.server}` : "";
+        const owner = entityOwners.get(d.eid);
+        const ownerStr = owner ? ` [${owner}]` : "";
+        lines.push(`  ${d.entity}#${d.eid.toString(16)}${ownerStr}.${d.comp}.${d.field}: local=${d.local} server=${d.server}${delta}`);
+      }
+      lines.push(``);
+      lines.push(`INPUTS (${inputs.length}):`);
+      for (const input2 of inputs) {
+        const label = clientLabels.get(input2.clientId) || input2.clientId.slice(0, 8);
+        lines.push(`  f${input2.frame} [${label}]: ${JSON.stringify(input2.data)}`);
+      }
+      lines.push(``);
+      if (this.lastGoodSnapshot) {
+        const goodEnts = Object.keys(this.lastGoodSnapshot.snapshot.entities || {}).length;
+        lines.push(`LAST GOOD SNAPSHOT (f${lastGoodFrame}): ${goodEnts} entities`);
+      } else {
+        lines.push(`LAST GOOD SNAPSHOT: none (never had 100% sync)`);
+      }
+      if (this.lastServerSnapshot.decoded) {
+        const serverEnts = Object.keys(this.lastServerSnapshot.decoded.entities || {}).length;
+        lines.push(`SERVER SNAPSHOT (f${this.lastServerSnapshot.frame}): ${serverEnts} entities`);
+      }
+      lines.push(`=== END DEBUG DATA ===`);
+      lines.push(`To get detailed replay data: game.getDivergenceReplay()`);
+      console.error(lines.join("\n"));
+    }
+    /**
+     * Download divergence replay data as JSON.
+     */
+    getDivergenceReplay() {
+      if (!this.divergenceCapture) {
+        console.warn("[REPLAY] No divergence captured yet.");
+        return;
+      }
+      const json = JSON.stringify(this.divergenceCapture, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `divergence-${this.divergenceCapture.divergenceFrame}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      console.log(`[REPLAY] Downloaded (${(json.length / 1024).toFixed(1)} KB)`);
     }
     // ==========================================
     // Game Loop
@@ -4079,7 +4150,8 @@ var SnakeGame = (() => {
       if (this.gameLoop)
         return;
       let lastSnapshotFrame = 0;
-      const SNAPSHOT_INTERVAL = 100;
+      const isLocalhost = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+      const SNAPSHOT_INTERVAL = isLocalhost ? 10 : 100;
       const loop = () => {
         if (this.renderer?.render) {
           this.renderer.render();
@@ -4837,6 +4909,136 @@ var SnakeGame = (() => {
     }
   };
 
+  // ../../engine/src/plugins/camera-system.ts
+  var CameraSystem = class {
+    constructor(game2, options = {}) {
+      this.game = game2;
+      this.options = {
+        defaultZoom: options.defaultZoom ?? 1,
+        defaultSmoothing: options.defaultSmoothing ?? 0.1,
+        minZoom: options.minZoom ?? 0.1,
+        maxZoom: options.maxZoom ?? 10
+      };
+      game2.addSystem(this.update.bind(this), { phase: "render" });
+    }
+    /**
+     * Update all cameras.
+     */
+    update() {
+      for (const entity of this.game.query("Camera2D")) {
+        this.updateCamera(entity);
+      }
+    }
+    /**
+     * Update a single camera entity.
+     */
+    updateCamera(cameraEntity2) {
+      const cam = cameraEntity2.get(Camera2D);
+      if (cam.followEntity !== 0) {
+        const target = this.game.world.getEntity(cam.followEntity);
+        if (target && !target.destroyed) {
+          try {
+            const transform = target.get(Transform2D);
+            cam.x += (transform.x - cam.x) * cam.smoothing;
+            cam.y += (transform.y - cam.y) * cam.smoothing;
+          } catch {
+          }
+        }
+      }
+      if (cam.zoom !== cam.targetZoom) {
+        cam.zoom += (cam.targetZoom - cam.zoom) * cam.smoothing;
+        cam.zoom = Math.max(this.options.minZoom, Math.min(this.options.maxZoom, cam.zoom));
+      }
+    }
+    /**
+     * Set camera to follow an entity.
+     */
+    follow(cameraEntity2, targetEntity) {
+      const cam = cameraEntity2.get(Camera2D);
+      cam.followEntity = targetEntity ? targetEntity.eid : 0;
+    }
+    /**
+     * Center camera on multiple entities (weighted by optional areas).
+     */
+    centerOn(cameraEntity2, entities, weights) {
+      if (entities.length === 0)
+        return;
+      const cam = cameraEntity2.get(Camera2D);
+      let totalWeight = 0;
+      let centerX = 0;
+      let centerY = 0;
+      for (let i = 0; i < entities.length; i++) {
+        const entity = entities[i];
+        if (entity.destroyed)
+          continue;
+        try {
+          const transform = entity.get(Transform2D);
+          const weight = weights?.[i] ?? 1;
+          centerX += transform.x * weight;
+          centerY += transform.y * weight;
+          totalWeight += weight;
+        } catch {
+        }
+      }
+      if (totalWeight > 0) {
+        cam.x += (centerX / totalWeight - cam.x) * cam.smoothing;
+        cam.y += (centerY / totalWeight - cam.y) * cam.smoothing;
+      }
+    }
+    /**
+     * Convert world coordinates to screen coordinates.
+     */
+    worldToScreen(cameraEntity2, worldX, worldY) {
+      const cam = cameraEntity2.get(Camera2D);
+      return {
+        x: (worldX - cam.x) * cam.zoom + cam.viewportWidth / 2,
+        y: (worldY - cam.y) * cam.zoom + cam.viewportHeight / 2
+      };
+    }
+    /**
+     * Convert screen coordinates to world coordinates.
+     */
+    screenToWorld(cameraEntity2, screenX, screenY) {
+      const cam = cameraEntity2.get(Camera2D);
+      return {
+        x: (screenX - cam.viewportWidth / 2) / cam.zoom + cam.x,
+        y: (screenY - cam.viewportHeight / 2) / cam.zoom + cam.y
+      };
+    }
+    /**
+     * Set zoom with optional target position.
+     */
+    setZoom(cameraEntity2, zoom, immediate = false) {
+      const cam = cameraEntity2.get(Camera2D);
+      const clampedZoom = Math.max(this.options.minZoom, Math.min(this.options.maxZoom, zoom));
+      cam.targetZoom = clampedZoom;
+      if (immediate) {
+        cam.zoom = clampedZoom;
+      }
+    }
+    /**
+     * Get visible bounds in world coordinates.
+     */
+    getVisibleBounds(cameraEntity2) {
+      const cam = cameraEntity2.get(Camera2D);
+      const halfWidth = cam.viewportWidth / 2 / cam.zoom;
+      const halfHeight = cam.viewportHeight / 2 / cam.zoom;
+      return {
+        left: cam.x - halfWidth,
+        top: cam.y - halfHeight,
+        right: cam.x + halfWidth,
+        bottom: cam.y + halfHeight
+      };
+    }
+    /**
+     * Check if a world point is visible.
+     */
+    isPointVisible(cameraEntity2, worldX, worldY, margin = 0) {
+      const bounds = this.getVisibleBounds(cameraEntity2);
+      return worldX >= bounds.left - margin && worldX <= bounds.right + margin && worldY >= bounds.top - margin && worldY <= bounds.bottom + margin;
+    }
+  };
+
   // ../../engine/src/plugins/determinism-guard.ts
   var originalFunctions = {};
   var installedGame = null;
@@ -4901,6 +5103,9 @@ var SnakeGame = (() => {
     }
     console.log("\u{1F6E1}\uFE0F Determinism guard enabled");
   }
+
+  // ../../engine/src/version.ts
+  var ENGINE_VERSION = "63bd2a3";
 
   // ../../engine/src/plugins/debug-ui.ts
   var debugDiv = null;
@@ -4978,8 +5183,8 @@ var SnakeGame = (() => {
       const upStr = formatBandwidth(up);
       const downStr = formatBandwidth(down);
       const driftStats = eng.getDriftStats?.() || { determinismPercent: 100, totalChecks: 0, matchingFieldCount: 0, totalFieldCount: 0 };
-      const detPct = driftStats.determinismPercent.toFixed(1);
-      const detColor = driftStats.determinismPercent >= 99.9 ? "#0f0" : driftStats.determinismPercent >= 95 ? "#ff0" : "#f00";
+      const detPct = (Math.floor(driftStats.determinismPercent * 10) / 10).toFixed(1);
+      const detColor = driftStats.determinismPercent === 100 ? "#0f0" : driftStats.determinismPercent >= 99 ? "#ff0" : "#f00";
       let syncStatus;
       if (isAuthority) {
         syncStatus = `<span style="color:#888">I'm authority</span>`;
@@ -5013,6 +5218,7 @@ var SnakeGame = (() => {
             <div>Client: <span style="color:#ff0">${clientId ? clientId.slice(0, 8) : "-"}</span></div>
 
             <div style="${sectionStyle}">ENGINE</div>
+            <div>Commit: <span style="color:#888">${ENGINE_VERSION}</span></div>
             <div>FPS: <span style="color:#0f0">${renderFps}</span> render, <span style="color:#0f0">${fps}</span> tick</div>
             <div>Net: <span style="color:#0f0">${upStr}</span> up, <span style="color:#f80">${downStr}</span> down</div>
 
@@ -6153,26 +6359,26 @@ var SnakeGame = (() => {
   var ANGULAR_DAMPING2 = toFixed(0.1);
   var SLEEP_THRESHOLD2 = toFixed(0.12);
 
-  // src/game.ts
+  // src/constants.ts
   var WORLD_WIDTH = 4e3;
   var WORLD_HEIGHT = 4e3;
   var SPEED = 8;
   var BOOST_SPEED = 18;
   var BOOST_COST_FRAMES = 10;
   var MIN_BOOST_LENGTH = 10;
+  var TURN_SPEED = 0.15;
   var BASE_HEAD_RADIUS = 16;
   var BASE_SEGMENT_RADIUS = 14;
   var INITIAL_LENGTH = 15;
+  var SEGMENT_SPAWN_INTERVAL = 1;
+  var SIZE_GROWTH_RATE = 0.02;
+  var MAX_SIZE_MULTIPLIER = 3;
   var FOOD_COUNT = 100;
   var MAX_FOOD = 200;
   var FOOD_SPAWN_CHANCE = 0.03;
-  var SEGMENT_SPAWN_INTERVAL = 1;
-  var TURN_SPEED = 0.15;
   var MIN_ZOOM = 0.3;
   var MAX_ZOOM = 1;
   var ZOOM_SPEED = 0.02;
-  var SIZE_GROWTH_RATE = 0.02;
-  var MAX_SIZE_MULTIPLIER = 3;
   var COLORS = [
     "#ff6b6b",
     "#4dabf7",
@@ -6187,26 +6393,8 @@ var SnakeGame = (() => {
     "#3bc9db",
     "#9775fa"
   ];
-  var game;
-  var renderer;
-  var physics;
-  var input;
-  var canvas;
-  var minimapCanvas;
-  var minimapCtx;
-  var statsLength;
-  var statsRank;
-  var WIDTH;
-  var HEIGHT;
-  var camera = {
-    x: WORLD_WIDTH / 2,
-    y: WORLD_HEIGHT / 2,
-    zoom: 1,
-    targetZoom: 1
-  };
-  var mouseX;
-  var mouseY;
-  var mouseDown = false;
+
+  // src/entities.ts
   var SnakeHead = defineComponent("SnakeHead", {
     length: INITIAL_LENGTH,
     dirX: 1,
@@ -6221,14 +6409,16 @@ var SnakeGame = (() => {
     ownerId: 0,
     spawnFrame: 0
   });
-  function getLocalClientId() {
-    const clientId = game.localClientId;
-    if (!clientId || typeof clientId !== "string")
-      return null;
-    return game.internClientId(clientId);
+  function defineEntities(game2) {
+    game2.defineEntity("snake-head").with(Transform2D).with(Sprite, { shape: SHAPE_CIRCLE, radius: BASE_HEAD_RADIUS, layer: 2 }).with(Body2D, { shapeType: SHAPE_CIRCLE, radius: BASE_HEAD_RADIUS, bodyType: BODY_KINEMATIC, isSensor: true }).with(Player).with(SnakeHead).register();
+    game2.defineEntity("snake-segment").with(Transform2D).with(Sprite, { shape: SHAPE_CIRCLE, radius: BASE_SEGMENT_RADIUS, layer: 1 }).with(Body2D, { shapeType: SHAPE_CIRCLE, radius: BASE_SEGMENT_RADIUS, bodyType: BODY_KINEMATIC, isSensor: true }).with(SnakeSegment).register();
+    game2.defineEntity("food").with(Transform2D).with(Sprite, { shape: SHAPE_CIRCLE, radius: 10, layer: 0 }).with(Body2D, { shapeType: SHAPE_CIRCLE, radius: 10, bodyType: BODY_STATIC }).register();
+    game2.defineEntity("camera").with(Camera2D, { smoothing: 0.15 }).syncNone().register();
   }
-  function getClientIdStr(numericId) {
-    return game.getClientIdString(numericId) || "";
+
+  // src/systems.ts
+  function getClientIdStr(game2, numericId) {
+    return game2.getClientIdString(numericId) || "";
   }
   function compareStrings(a, b) {
     if (a < b)
@@ -6245,11 +6435,11 @@ var SnakeGame = (() => {
     const sizeMultiplier = getSizeMultiplier(length);
     return Math.max(MIN_ZOOM, MAX_ZOOM / sizeMultiplier);
   }
-  function killSnake(clientId) {
-    const head = game.world.getEntityByClientId(clientId);
+  function killSnake(game2, clientId) {
+    const head = game2.world.getEntityByClientId(clientId);
     if (!head || head.destroyed)
       return;
-    const segments = [...game.query("snake-segment")].sort((a, b) => a.id - b.id);
+    const segments = [...game2.query("snake-segment")].sort((a, b) => a.eid - b.eid);
     for (const seg of segments) {
       if (seg.get(SnakeSegment).ownerId === clientId) {
         seg.destroy();
@@ -6257,53 +6447,50 @@ var SnakeGame = (() => {
     }
     head.destroy();
   }
-  function spawnSnake(clientId) {
-    const color = game.internString("color", COLORS[dRandom() * COLORS.length | 0]);
+  function spawnSnake(game2, clientId) {
+    const color = game2.internString("color", COLORS[dRandom() * COLORS.length | 0]);
     const startX = 200 + dRandom() * (WORLD_WIDTH - 400) | 0;
     const startY = 200 + dRandom() * (WORLD_HEIGHT - 400) | 0;
-    game.spawn("snake-head", {
+    game2.spawn("snake-head", {
       x: startX,
       y: startY,
       clientId,
       color,
       length: INITIAL_LENGTH,
-      lastSpawnFrame: game.frame
+      lastSpawnFrame: game2.frame
     });
   }
-  function spawnFood() {
-    const color = game.internString("color", COLORS[dRandom() * COLORS.length | 0]);
-    game.spawn("food", {
-      x: 50 + dRandom() * (WORLD_WIDTH - 100) | 0,
-      y: 50 + dRandom() * (WORLD_HEIGHT - 100) | 0,
-      color
+  function spawnFood(game2, x, y, color) {
+    const foodColor = color ?? game2.internString("color", COLORS[dRandom() * COLORS.length | 0]);
+    const foodX = x ?? 50 + dRandom() * (WORLD_WIDTH - 100) | 0;
+    const foodY = y ?? 50 + dRandom() * (WORLD_HEIGHT - 100) | 0;
+    game2.spawn("food", {
+      x: foodX,
+      y: foodY,
+      color: foodColor
     });
   }
-  function defineEntities() {
-    game.defineEntity("snake-head").with(Transform2D).with(Sprite, { shape: SHAPE_CIRCLE, radius: BASE_HEAD_RADIUS, layer: 2 }).with(Body2D, { shapeType: SHAPE_CIRCLE, radius: BASE_HEAD_RADIUS, bodyType: BODY_KINEMATIC, isSensor: true }).with(Player).with(SnakeHead).register();
-    game.defineEntity("snake-segment").with(Transform2D).with(Sprite, { shape: SHAPE_CIRCLE, radius: BASE_SEGMENT_RADIUS, layer: 1 }).with(Body2D, { shapeType: SHAPE_CIRCLE, radius: BASE_SEGMENT_RADIUS, bodyType: BODY_KINEMATIC, isSensor: true }).with(SnakeSegment).register();
-    game.defineEntity("food").with(Transform2D).with(Sprite, { shape: SHAPE_CIRCLE, radius: 10, layer: 0 }).with(Body2D, { shapeType: SHAPE_CIRCLE, radius: 10, bodyType: BODY_STATIC }).register();
-  }
-  function setupCollisions() {
-    physics.onCollision("snake-head", "snake-segment", (head, segment) => {
+  function setupCollisions(game2, physics2) {
+    physics2.onCollision("snake-head", "snake-segment", (head, segment) => {
       if (head.destroyed || segment.destroyed)
         return;
       const headClientId = head.get(Player).clientId;
       const segOwnerId = segment.get(SnakeSegment).ownerId;
       if (segOwnerId === headClientId)
         return;
-      killSnake(headClientId);
+      killSnake(game2, headClientId);
     });
-    physics.onCollision("snake-head", "food", (head, food) => {
+    physics2.onCollision("snake-head", "food", (head, food) => {
       if (food.destroyed)
         return;
       head.get(SnakeHead).length++;
       food.destroy();
     });
   }
-  function setupSystems() {
-    game.addSystem(() => {
+  function setupSystems(game2) {
+    game2.addSystem(() => {
       const playerHeads = /* @__PURE__ */ new Map();
-      const allHeads = [...game.query("snake-head")].sort((a, b) => a.id - b.id);
+      const allHeads = [...game2.query("snake-head")].sort((a, b) => a.eid - b.eid);
       for (const head of allHeads) {
         if (head.destroyed)
           continue;
@@ -6313,12 +6500,12 @@ var SnakeGame = (() => {
         playerHeads.set(clientId, head);
       }
       const sortedPlayers = [...playerHeads.entries()].sort(
-        (a, b) => compareStrings(getClientIdStr(a[0]), getClientIdStr(b[0]))
+        (a, b) => compareStrings(getClientIdStr(game2, a[0]), getClientIdStr(game2, b[0]))
       );
       for (const [clientId, head] of sortedPlayers) {
         if (head.destroyed)
           continue;
-        const playerInput = game.world.getInput(clientId);
+        const playerInput = game2.world.getInput(clientId);
         const sh = head.get(SnakeHead);
         const t = head.get(Transform2D);
         sh.prevDirX = sh.dirX;
@@ -6350,7 +6537,7 @@ var SnakeGame = (() => {
           if (sh.boostFrames >= BOOST_COST_FRAMES) {
             sh.length--;
             sh.boostFrames = 0;
-            game.spawn("food", {
+            game2.spawn("food", {
               x: t.x - sh.dirX * 30 | 0,
               y: t.y - sh.dirY * 30 | 0,
               color: head.get(Sprite).color
@@ -6359,39 +6546,39 @@ var SnakeGame = (() => {
         } else {
           sh.boostFrames = 0;
         }
-        const body = head.get(Body2D);
-        body.vx = sh.dirX * currentSpeed * 60;
-        body.vy = sh.dirY * currentSpeed * 60;
+        const vx = sh.dirX * currentSpeed * 60;
+        const vy = sh.dirY * currentSpeed * 60;
+        head.setVelocity(vx, vy);
         const radius = head.get(Sprite).radius;
         if (t.x - radius < 0 || t.x + radius > WORLD_WIDTH || t.y - radius < 0 || t.y + radius > WORLD_HEIGHT) {
-          killSnake(clientId);
+          killSnake(game2, clientId);
           continue;
         }
-        const frameDiff = game.frame - sh.lastSpawnFrame;
+        const frameDiff = game2.frame - sh.lastSpawnFrame;
         if (frameDiff >= SEGMENT_SPAWN_INTERVAL) {
           const color = head.get(Sprite).color;
-          game.spawn("snake-segment", {
+          game2.spawn("snake-segment", {
             x: t.x,
             y: t.y,
             color,
             ownerId: clientId,
-            spawnFrame: game.frame
+            spawnFrame: game2.frame
           });
-          sh.lastSpawnFrame = game.frame;
+          sh.lastSpawnFrame = game2.frame;
         }
       }
     }, { phase: "update" });
-    game.addSystem(() => {
+    game2.addSystem(() => {
       const headMaxAge = /* @__PURE__ */ new Map();
-      const allHeads = [...game.query("snake-head")].sort((a, b) => a.id - b.id);
+      const allHeads = [...game2.query("snake-head")].sort((a, b) => a.eid - b.eid);
       for (const head of allHeads) {
         if (head.destroyed)
           continue;
         const clientId = head.get(Player).clientId;
         const maxLength = head.get(SnakeHead).length;
-        headMaxAge.set(clientId, game.frame - maxLength * SEGMENT_SPAWN_INTERVAL);
+        headMaxAge.set(clientId, game2.frame - maxLength * SEGMENT_SPAWN_INTERVAL);
       }
-      const allSegments = [...game.query("snake-segment")].sort((a, b) => a.id - b.id);
+      const allSegments = [...game2.query("snake-segment")].sort((a, b) => a.eid - b.eid);
       for (const seg of allSegments) {
         if (seg.destroyed)
           continue;
@@ -6402,14 +6589,14 @@ var SnakeGame = (() => {
         }
       }
     }, { phase: "update" });
-    game.addSystem(() => {
-      if (game.getEntitiesByType("food").length < MAX_FOOD && dRandom() < FOOD_SPAWN_CHANCE) {
-        spawnFood();
+    game2.addSystem(() => {
+      if (game2.getEntitiesByType("food").length < MAX_FOOD && dRandom() < FOOD_SPAWN_CHANCE) {
+        spawnFood(game2);
       }
     }, { phase: "update" });
-    game.addSystem(() => {
+    game2.addSystem(() => {
       const ownerLengths = /* @__PURE__ */ new Map();
-      const allHeads = [...game.query("snake-head")].sort((a, b) => a.id - b.id);
+      const allHeads = [...game2.query("snake-head")].sort((a, b) => a.eid - b.eid);
       for (const head of allHeads) {
         if (head.destroyed)
           continue;
@@ -6421,7 +6608,7 @@ var SnakeGame = (() => {
         head.get(Sprite).radius = headRadius;
         head.get(Body2D).radius = headRadius;
       }
-      const allSegments = [...game.query("snake-segment")].sort((a, b) => a.id - b.id);
+      const allSegments = [...game2.query("snake-segment")].sort((a, b) => a.eid - b.eid);
       for (const seg of allSegments) {
         if (seg.destroyed)
           continue;
@@ -6432,208 +6619,239 @@ var SnakeGame = (() => {
         seg.get(Body2D).radius = segRadius;
       }
     }, { phase: "update" });
-    game.addSystem(() => {
-      const localId = getLocalClientId();
+  }
+  function updateCamera(game2, cameraEntity2, getLocalClientId2) {
+    const localId = getLocalClientId2();
+    if (localId === null)
+      return;
+    const head = game2.world.getEntityByClientId(localId);
+    if (!head || head.destroyed)
+      return;
+    const t = head.get(Transform2D);
+    const length = head.get(SnakeHead).length;
+    const camera = cameraEntity2.get(Camera2D);
+    const targetZoom = getTargetZoom(length);
+    camera.zoom += (targetZoom - camera.zoom) * ZOOM_SPEED;
+    camera.x += (t.x - camera.x) * camera.smoothing;
+    camera.y += (t.y - camera.y) * camera.smoothing;
+  }
+
+  // src/render.ts
+  function createRenderer(game2, renderer2, getCameraEntity, canvas2, minimapCanvas2, statsLength2, statsRank2, getLocalClientIdFn) {
+    const canvasCtx = renderer2.context;
+    const minimapCtx = minimapCanvas2.getContext("2d");
+    const width = canvas2.width;
+    const height = canvas2.height;
+    function renderWithCamera() {
+      const cameraEntity2 = getCameraEntity();
+      const alpha = game2.getRenderAlpha();
+      const camera = cameraEntity2.get(Camera2D);
+      updateCamera(game2, cameraEntity2, getLocalClientIdFn);
+      canvasCtx.fillStyle = "#111";
+      canvasCtx.fillRect(0, 0, width, height);
+      const camX = camera.x;
+      const camY = camera.y;
+      canvasCtx.save();
+      canvasCtx.translate(width / 2, height / 2);
+      canvasCtx.scale(camera.zoom, camera.zoom);
+      canvasCtx.translate(-camX, -camY);
+      canvasCtx.strokeStyle = "#333";
+      canvasCtx.lineWidth = 4 / camera.zoom;
+      canvasCtx.strokeRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+      canvasCtx.strokeStyle = "#1a1a1a";
+      canvasCtx.lineWidth = 1 / camera.zoom;
+      const gridSize = 200;
+      for (let x = 0; x <= WORLD_WIDTH; x += gridSize) {
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(x, 0);
+        canvasCtx.lineTo(x, WORLD_HEIGHT);
+        canvasCtx.stroke();
+      }
+      for (let y = 0; y <= WORLD_HEIGHT; y += gridSize) {
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(0, y);
+        canvasCtx.lineTo(WORLD_WIDTH, y);
+        canvasCtx.stroke();
+      }
+      for (const food of game2.query("food")) {
+        if (food.destroyed)
+          continue;
+        food.interpolate(alpha);
+        const x = food.render?.interpX ?? food.get(Transform2D).x;
+        const y = food.render?.interpY ?? food.get(Transform2D).y;
+        const sprite = food.get(Sprite);
+        canvasCtx.fillStyle = game2.getString("color", sprite.color) || "#fff";
+        canvasCtx.beginPath();
+        canvasCtx.arc(x, y, sprite.radius, 0, Math.PI * 2);
+        canvasCtx.fill();
+      }
+      for (const seg of game2.query("snake-segment")) {
+        if (seg.destroyed)
+          continue;
+        seg.interpolate(alpha);
+        const x = seg.render?.interpX ?? seg.get(Transform2D).x;
+        const y = seg.render?.interpY ?? seg.get(Transform2D).y;
+        const sprite = seg.get(Sprite);
+        canvasCtx.fillStyle = game2.getString("color", sprite.color) || "#fff";
+        canvasCtx.beginPath();
+        canvasCtx.arc(x, y, sprite.radius, 0, Math.PI * 2);
+        canvasCtx.fill();
+      }
+      for (const head of game2.query("snake-head")) {
+        if (head.destroyed)
+          continue;
+        head.interpolate(alpha);
+        const x = head.render?.interpX ?? head.get(Transform2D).x;
+        const y = head.render?.interpY ?? head.get(Transform2D).y;
+        const sprite = head.get(Sprite);
+        const sh = head.get(SnakeHead);
+        const sizeMult = getSizeMultiplier(sh.length);
+        const colorStr = game2.getString("color", sprite.color) || "#fff";
+        if (sh.boosting) {
+          canvasCtx.save();
+          canvasCtx.shadowColor = colorStr;
+          canvasCtx.shadowBlur = 30;
+          canvasCtx.fillStyle = colorStr;
+          canvasCtx.globalAlpha = 0.4;
+          canvasCtx.beginPath();
+          canvasCtx.arc(x, y, sprite.radius * 2.5, 0, Math.PI * 2);
+          canvasCtx.fill();
+          canvasCtx.globalAlpha = 0.6;
+          canvasCtx.beginPath();
+          canvasCtx.arc(x, y, sprite.radius * 1.8, 0, Math.PI * 2);
+          canvasCtx.fill();
+          canvasCtx.restore();
+        }
+        canvasCtx.fillStyle = colorStr;
+        canvasCtx.beginPath();
+        canvasCtx.arc(x, y, sprite.radius, 0, Math.PI * 2);
+        canvasCtx.fill();
+        const dirX = sh.prevDirX + (sh.dirX - sh.prevDirX) * alpha;
+        const dirY = sh.prevDirY + (sh.dirY - sh.prevDirY) * alpha;
+        const eyeOffset = 6 * sizeMult;
+        const eyeRadius = 5 * sizeMult;
+        const pupilRadius = 2 * sizeMult;
+        const perpX = -dirY, perpY = dirX;
+        for (const side of [-1, 1]) {
+          const ex = x + dirX * eyeOffset + perpX * eyeOffset * side;
+          const ey = y + dirY * eyeOffset + perpY * eyeOffset * side;
+          canvasCtx.fillStyle = "#fff";
+          canvasCtx.beginPath();
+          canvasCtx.arc(ex, ey, eyeRadius, 0, Math.PI * 2);
+          canvasCtx.fill();
+          canvasCtx.fillStyle = "#000";
+          canvasCtx.beginPath();
+          canvasCtx.arc(ex + dirX * pupilRadius, ey + dirY * pupilRadius, pupilRadius, 0, Math.PI * 2);
+          canvasCtx.fill();
+        }
+      }
+      canvasCtx.restore();
+      drawMinimap(camera);
+      updateStats();
+    }
+    function updateStats() {
+      const localId = getLocalClientIdFn();
       if (localId === null)
         return;
-      const head = game.world.getEntityByClientId(localId);
-      if (!head || head.destroyed)
+      const localHead = game2.world.getEntityByClientId(localId);
+      if (!localHead || localHead.destroyed) {
+        statsLength2.textContent = "0";
+        statsRank2.textContent = "- of -";
         return;
-      const t = head.get(Transform2D);
-      const length = head.get(SnakeHead).length;
-      camera.targetZoom = getTargetZoom(length);
-      camera.zoom += (camera.targetZoom - camera.zoom) * ZOOM_SPEED;
-      camera.x = t.x;
-      camera.y = t.y;
-    }, { phase: "update" });
-  }
-  function renderWithCamera() {
-    const ctx = renderer.context;
-    const alpha = game.getRenderAlpha();
-    ctx.fillStyle = "#111";
-    ctx.fillRect(0, 0, WIDTH, HEIGHT);
-    let camX = camera.x, camY = camera.y;
-    const localId = getLocalClientId();
-    const localHead = localId ? game.world.getEntityByClientId(localId) : null;
-    if (localHead && !localHead.destroyed) {
-      localHead.interpolate(alpha);
-      const t = localHead.get(Transform2D);
-      camX = localHead.render?.interpX ?? t.x;
-      camY = localHead.render?.interpY ?? t.y;
-    }
-    ctx.save();
-    ctx.translate(WIDTH / 2, HEIGHT / 2);
-    ctx.scale(camera.zoom, camera.zoom);
-    ctx.translate(-camX, -camY);
-    ctx.strokeStyle = "#333";
-    ctx.lineWidth = 4 / camera.zoom;
-    ctx.strokeRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
-    ctx.strokeStyle = "#1a1a1a";
-    ctx.lineWidth = 1 / camera.zoom;
-    const gridSize = 200;
-    for (let x = 0; x <= WORLD_WIDTH; x += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, WORLD_HEIGHT);
-      ctx.stroke();
-    }
-    for (let y = 0; y <= WORLD_HEIGHT; y += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(WORLD_WIDTH, y);
-      ctx.stroke();
-    }
-    for (const food of game.query("food")) {
-      if (food.destroyed)
-        continue;
-      food.interpolate(alpha);
-      const x = food.render?.interpX ?? food.get(Transform2D).x;
-      const y = food.render?.interpY ?? food.get(Transform2D).y;
-      const sprite = food.get(Sprite);
-      ctx.fillStyle = game.getString("color", sprite.color) || "#fff";
-      ctx.beginPath();
-      ctx.arc(x, y, sprite.radius, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    for (const seg of game.query("snake-segment")) {
-      if (seg.destroyed)
-        continue;
-      seg.interpolate(alpha);
-      const x = seg.render?.interpX ?? seg.get(Transform2D).x;
-      const y = seg.render?.interpY ?? seg.get(Transform2D).y;
-      const sprite = seg.get(Sprite);
-      ctx.fillStyle = game.getString("color", sprite.color) || "#fff";
-      ctx.beginPath();
-      ctx.arc(x, y, sprite.radius, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    for (const head of game.query("snake-head")) {
-      if (head.destroyed)
-        continue;
-      head.interpolate(alpha);
-      const x = head.render?.interpX ?? head.get(Transform2D).x;
-      const y = head.render?.interpY ?? head.get(Transform2D).y;
-      const sprite = head.get(Sprite);
-      const sh = head.get(SnakeHead);
-      const sizeMult = getSizeMultiplier(sh.length);
-      const colorStr = game.getString("color", sprite.color) || "#fff";
-      if (sh.boosting) {
-        ctx.save();
-        ctx.shadowColor = colorStr;
-        ctx.shadowBlur = 30;
-        ctx.fillStyle = colorStr;
-        ctx.globalAlpha = 0.4;
-        ctx.beginPath();
-        ctx.arc(x, y, sprite.radius * 2.5, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalAlpha = 0.6;
-        ctx.beginPath();
-        ctx.arc(x, y, sprite.radius * 1.8, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
       }
-      ctx.fillStyle = colorStr;
-      ctx.beginPath();
-      ctx.arc(x, y, sprite.radius, 0, Math.PI * 2);
-      ctx.fill();
-      const dirX = sh.prevDirX + (sh.dirX - sh.prevDirX) * alpha;
-      const dirY = sh.prevDirY + (sh.dirY - sh.prevDirY) * alpha;
-      const eyeOffset = 6 * sizeMult;
-      const eyeRadius = 5 * sizeMult;
-      const pupilRadius = 2 * sizeMult;
-      const perpX = -dirY, perpY = dirX;
-      for (const side of [-1, 1]) {
-        const ex = x + dirX * eyeOffset + perpX * eyeOffset * side;
-        const ey = y + dirY * eyeOffset + perpY * eyeOffset * side;
-        ctx.fillStyle = "#fff";
-        ctx.beginPath();
-        ctx.arc(ex, ey, eyeRadius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = "#000";
-        ctx.beginPath();
-        ctx.arc(ex + dirX * pupilRadius, ey + dirY * pupilRadius, pupilRadius, 0, Math.PI * 2);
-        ctx.fill();
+      const myLength = localHead.get(SnakeHead).length;
+      statsLength2.textContent = String(myLength);
+      const snakes = [];
+      for (const head of game2.query("snake-head")) {
+        if (head.destroyed)
+          continue;
+        snakes.push({
+          clientId: head.get(Player).clientId,
+          length: head.get(SnakeHead).length
+        });
       }
+      snakes.sort((a, b) => b.length - a.length);
+      const rank = snakes.findIndex((s) => s.clientId === localId) + 1;
+      statsRank2.textContent = `${rank} of ${snakes.length}`;
     }
-    ctx.restore();
-    drawMinimap(camX, camY);
-    updateStats();
-  }
-  function updateStats() {
-    const localId = getLocalClientId();
-    if (!localId)
-      return;
-    const localHead = game.world.getEntityByClientId(localId);
-    if (!localHead || localHead.destroyed) {
-      statsLength.textContent = "0";
-      statsRank.textContent = "- of -";
-      return;
-    }
-    const myLength = localHead.get(SnakeHead).length;
-    statsLength.textContent = String(myLength);
-    const snakes = [];
-    for (const head of game.query("snake-head")) {
-      if (head.destroyed)
-        continue;
-      snakes.push({
-        clientId: head.get(Player).clientId,
-        length: head.get(SnakeHead).length
-      });
-    }
-    snakes.sort((a, b) => b.length - a.length);
-    const rank = snakes.findIndex((s) => s.clientId === localId) + 1;
-    statsRank.textContent = `${rank} of ${snakes.length}`;
-  }
-  function drawMinimap(camX, camY) {
-    const mmW = minimapCanvas.width;
-    const mmH = minimapCanvas.height;
-    const scaleX = mmW / WORLD_WIDTH;
-    const scaleY = mmH / WORLD_HEIGHT;
-    minimapCtx.fillStyle = "rgba(0, 0, 0, 0.8)";
-    minimapCtx.fillRect(0, 0, mmW, mmH);
-    minimapCtx.strokeStyle = "#444";
-    minimapCtx.lineWidth = 1;
-    minimapCtx.strokeRect(0, 0, mmW, mmH);
-    minimapCtx.fillStyle = "#555";
-    for (const food of game.query("food")) {
-      if (food.destroyed)
-        continue;
-      const t = food.get(Transform2D);
-      const mx = t.x * scaleX;
-      const my = t.y * scaleY;
-      minimapCtx.fillRect(mx - 1, my - 1, 2, 2);
-    }
-    for (const head of game.query("snake-head")) {
-      if (head.destroyed)
-        continue;
-      const t = head.get(Transform2D);
-      const sprite = head.get(Sprite);
-      const color = game.getString("color", sprite.color) || "#fff";
-      const clientId = head.get(Player).clientId;
-      const isLocal = clientId === getLocalClientId();
-      minimapCtx.fillStyle = color;
-      const mx = t.x * scaleX;
-      const my = t.y * scaleY;
-      minimapCtx.beginPath();
-      minimapCtx.arc(mx, my, isLocal ? 4 : 3, 0, Math.PI * 2);
-      minimapCtx.fill();
-      if (isLocal) {
-        minimapCtx.strokeStyle = "#fff";
-        minimapCtx.lineWidth = 1;
+    function drawMinimap(camera) {
+      const camX = camera.x;
+      const camY = camera.y;
+      const mmW = minimapCanvas2.width;
+      const mmH = minimapCanvas2.height;
+      const scaleX = mmW / WORLD_WIDTH;
+      const scaleY = mmH / WORLD_HEIGHT;
+      minimapCtx.fillStyle = "rgba(0, 0, 0, 0.8)";
+      minimapCtx.fillRect(0, 0, mmW, mmH);
+      minimapCtx.strokeStyle = "#444";
+      minimapCtx.lineWidth = 1;
+      minimapCtx.strokeRect(0, 0, mmW, mmH);
+      minimapCtx.fillStyle = "#555";
+      for (const food of game2.query("food")) {
+        if (food.destroyed)
+          continue;
+        const t = food.get(Transform2D);
+        const mx = t.x * scaleX;
+        const my = t.y * scaleY;
+        minimapCtx.fillRect(mx - 1, my - 1, 2, 2);
+      }
+      const localId = getLocalClientIdFn();
+      for (const head of game2.query("snake-head")) {
+        if (head.destroyed)
+          continue;
+        const t = head.get(Transform2D);
+        const sprite = head.get(Sprite);
+        const color = game2.getString("color", sprite.color) || "#fff";
+        const clientId = head.get(Player).clientId;
+        const isLocal = clientId === localId;
+        minimapCtx.fillStyle = color;
+        const mx = t.x * scaleX;
+        const my = t.y * scaleY;
         minimapCtx.beginPath();
-        minimapCtx.arc(mx, my, 6, 0, Math.PI * 2);
-        minimapCtx.stroke();
+        minimapCtx.arc(mx, my, isLocal ? 4 : 3, 0, Math.PI * 2);
+        minimapCtx.fill();
+        if (isLocal) {
+          minimapCtx.strokeStyle = "#fff";
+          minimapCtx.lineWidth = 1;
+          minimapCtx.beginPath();
+          minimapCtx.arc(mx, my, 6, 0, Math.PI * 2);
+          minimapCtx.stroke();
+        }
       }
+      const viewW = width / camera.zoom * scaleX;
+      const viewH = height / camera.zoom * scaleY;
+      const viewX = camX * scaleX - viewW / 2;
+      const viewY = camY * scaleY - viewH / 2;
+      minimapCtx.strokeStyle = "rgba(255, 255, 255, 0.5)";
+      minimapCtx.lineWidth = 1;
+      minimapCtx.strokeRect(viewX, viewY, viewW, viewH);
     }
-    const viewW = WIDTH / camera.zoom * scaleX;
-    const viewH = HEIGHT / camera.zoom * scaleY;
-    const viewX = camX * scaleX - viewW / 2;
-    const viewY = camY * scaleY - viewH / 2;
-    minimapCtx.strokeStyle = "rgba(255, 255, 255, 0.5)";
-    minimapCtx.lineWidth = 1;
-    minimapCtx.strokeRect(viewX, viewY, viewW, viewH);
+    return renderWithCamera;
   }
-  function setupInput() {
+
+  // src/game.ts
+  var game;
+  var renderer;
+  var physics;
+  var input;
+  var cameraSystem;
+  var cameraEntity;
+  var canvas;
+  var minimapCanvas;
+  var statsLength;
+  var statsRank;
+  var WIDTH;
+  var HEIGHT;
+  var mouseX;
+  var mouseY;
+  var mouseDown = false;
+  function getLocalClientId() {
+    const clientId = game.localClientId;
+    if (!clientId || typeof clientId !== "string")
+      return null;
+    return game.internClientId(clientId);
+  }
+  function setupInput(getCameraEntity) {
     mouseX = WIDTH / 2;
     mouseY = HEIGHT / 2;
     canvas.addEventListener("mousemove", (e) => {
@@ -6654,17 +6872,18 @@ var SnakeGame = (() => {
     });
     input.action("target", {
       type: "vector",
-      bindings: [() => ({
-        x: Math.round(camera.x + (mouseX - WIDTH / 2) / camera.zoom),
-        y: Math.round(camera.y + (mouseY - HEIGHT / 2) / camera.zoom)
-      })]
+      bindings: [() => {
+        const cam = getCameraEntity().get(Camera2D);
+        const worldX = (mouseX - WIDTH / 2) / cam.zoom + cam.x;
+        const worldY = (mouseY - HEIGHT / 2) / cam.zoom + cam.y;
+        return { x: worldX, y: worldY };
+      }]
     });
     input.action("boost", { type: "button", bindings: [() => mouseDown] });
   }
   function initGame() {
     canvas = document.getElementById("game");
     minimapCanvas = document.getElementById("minimap");
-    minimapCtx = minimapCanvas.getContext("2d");
     statsLength = document.querySelector("#stats .length");
     statsRank = document.getElementById("rank-text");
     WIDTH = canvas.width;
@@ -6673,22 +6892,56 @@ var SnakeGame = (() => {
     renderer = game.addPlugin(Simple2DRenderer, canvas);
     physics = game.addPlugin(Physics2DSystem, { gravity: { x: 0, y: 0 } });
     input = game.addPlugin(InputPlugin, canvas);
+    cameraSystem = game.addPlugin(CameraSystem);
     window.game = game;
-    defineEntities();
-    setupCollisions();
-    setupSystems();
-    setupInput();
-    renderer.render = renderWithCamera;
-    game.connect("snake-v33", {
+    defineEntities(game);
+    setupCollisions(game, physics);
+    setupSystems(game);
+    cameraEntity = game.spawn("camera");
+    const cam = cameraEntity.get(Camera2D);
+    cam.x = WORLD_WIDTH / 2;
+    cam.y = WORLD_HEIGHT / 2;
+    renderer.camera = cameraEntity;
+    function ensureCameraEntity() {
+      if (!cameraEntity || cameraEntity.destroyed || !cameraEntity.has(Camera2D)) {
+        cameraEntity = game.spawn("camera");
+        const cam2 = cameraEntity.get(Camera2D);
+        cam2.x = WORLD_WIDTH / 2;
+        cam2.y = WORLD_HEIGHT / 2;
+        renderer.camera = cameraEntity;
+      }
+      return cameraEntity;
+    }
+    setupInput(ensureCameraEntity);
+    renderer.render = createRenderer(
+      game,
+      renderer,
+      ensureCameraEntity,
+      canvas,
+      minimapCanvas,
+      statsLength,
+      statsRank,
+      getLocalClientId
+    );
+    game.connect("snake-v34", {
       onRoomCreate() {
         for (let i = 0; i < FOOD_COUNT; i++)
-          spawnFood();
+          spawnFood(game);
       },
       onConnect(clientId) {
-        spawnSnake(clientId);
+        spawnSnake(game, clientId);
+        if (clientId === game.localClientId) {
+          const player = game.getEntityByClientId(clientId);
+          if (player) {
+            const t = player.get(Transform2D);
+            const cam2 = ensureCameraEntity().get(Camera2D);
+            cam2.x = t.x;
+            cam2.y = t.y;
+          }
+        }
       },
       onDisconnect(clientId) {
-        killSnake(game.internClientId(clientId));
+        killSnake(game, game.internClientId(clientId));
       }
     });
     enableDebugUI(game);

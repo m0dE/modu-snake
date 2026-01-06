@@ -3,12 +3,13 @@
  *
  * Features:
  * - Deterministic transform: converts Math.sqrt -> dSqrt, Math.random -> dRandom
- * - Bundles game + engine into single file
+ * - Bundles game code (engine loaded from CDN/localhost)
  * - Source maps for debugging
  *
  * Usage:
  *   node build.js           # Build once
  *   node build.js --watch   # Watch mode
+ *   node build.js --watch --serve  # Watch + dev server
  */
 
 const esbuild = require('esbuild');
@@ -79,6 +80,24 @@ const deterministicPlugin = {
     },
 };
 
+// Plugin to map 'modu-engine' imports to the CDN global (window.Modu)
+const cdnEnginePlugin = {
+    name: 'cdn-engine',
+    setup(build) {
+        // Resolve 'modu-engine' to a virtual module
+        build.onResolve({ filter: /^modu-engine$/ }, () => ({
+            path: 'modu-engine',
+            namespace: 'cdn-global',
+        }));
+
+        // Return a module that re-exports from the global
+        build.onLoad({ filter: /.*/, namespace: 'cdn-global' }, () => ({
+            contents: 'module.exports = window.Modu;',
+            loader: 'js',
+        }));
+    },
+};
+
 const buildOptions = {
     entryPoints: ['src/game.ts'],
     bundle: true,
@@ -87,10 +106,7 @@ const buildOptions = {
     globalName: 'SnakeGame',
     sourcemap: true,
     target: 'es2020',
-    plugins: [deterministicPlugin],
-    alias: {
-        'modu-engine': '../../engine/src/index.ts',
-    },
+    plugins: [deterministicPlugin, cdnEnginePlugin],
     define: {
         'process.env.NODE_ENV': '"development"',
     },
@@ -106,41 +122,37 @@ async function build() {
         fs.mkdirSync('dist');
     }
 
-    // Copy index.html to dist
-    let indexHtml = fs.readFileSync('index.html', 'utf8');
-    fs.writeFileSync('dist/index.html', indexHtml);
-    console.log('[build] Copied index.html to dist/');
-
-    // Copy network SDK to dist
-    const sdkPath = path.join(__dirname, '../../network/sdk/dist/modu-network.iife.js');
-    if (fs.existsSync(sdkPath)) {
-        fs.copyFileSync(sdkPath, 'dist/modu-network.js');
-        console.log('[build] Copied modu-network SDK to dist/');
-    } else {
-        console.warn('[build] Warning: modu-network SDK not found at', sdkPath);
-    }
-
     if (watch) {
         const ctx = await esbuild.context(buildOptions);
         await ctx.watch();
         console.log('[build] Watching for changes...');
 
         if (serve) {
-            // Kill any existing process on the port
-            const { execSync } = require('child_process');
-            try {
-                if (process.platform === 'win32') {
-                    execSync('npx kill-port 8080', { stdio: 'ignore' });
-                } else {
-                    execSync('lsof -ti:8080 | xargs kill -9 2>/dev/null || true', { stdio: 'ignore' });
-                }
-            } catch {}
-
-            const { host, port } = await ctx.serve({
-                servedir: 'dist',
-                port: 8080,
+            const http = require('http');
+            const server = http.createServer((req, res) => {
+                // Serve index-dev.html for root path
+                let filePath = req.url === '/' ? '/index-dev.html' : req.url;
+                const fullPath = path.join('dist', filePath);
+                const ext = path.extname(fullPath);
+                const contentTypes = {
+                    '.html': 'text/html',
+                    '.js': 'text/javascript',
+                    '.css': 'text/css',
+                    '.map': 'application/json',
+                };
+                fs.readFile(fullPath, (err, data) => {
+                    if (err) {
+                        res.writeHead(404);
+                        res.end('Not found');
+                        return;
+                    }
+                    res.writeHead(200, { 'Content-Type': contentTypes[ext] || 'text/plain' });
+                    res.end(data);
+                });
             });
-            console.log(`[build] Serving at http://localhost:${port}`);
+            server.listen(8081, () => {
+                console.log('[build] Dev server: http://localhost:8081');
+            });
         }
     } else {
         await esbuild.build(buildOptions);
