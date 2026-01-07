@@ -27,11 +27,15 @@ import {
 // Components (all fields default to i32/fixed-point for determinism)
 // ============================================
 
+// Direction values are scaled by 1000 for fixed-point representation
+// e.g., dirX=1000 means direction 1.0, dirX=-500 means direction -0.5
+export const DIR_SCALE = 1000;
+
 export const SnakeHead = defineComponent('SnakeHead', {
     length: INITIAL_LENGTH,
-    dirX: 1,
-    dirY: 0,
-    prevDirX: 1,
+    dirX: DIR_SCALE,    // Start facing right: 1.0 * 1000 = 1000
+    dirY: 0,            // 0.0 * 1000 = 0
+    prevDirX: DIR_SCALE,
     prevDirY: 0,
     lastSpawnFrame: 0,
     boostFrames: 0,

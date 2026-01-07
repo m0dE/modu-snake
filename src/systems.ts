@@ -14,6 +14,12 @@ import {
     Sprite,
     Camera2D,
     Physics2DSystem,
+    toFixed,
+    toFloat,
+    fpMul,
+    fpDiv,
+    fpSqrt,
+    FP_ONE,
 } from 'modu-engine';
 
 import {
@@ -23,13 +29,10 @@ import {
     BOOST_SPEED,
     BOOST_COST_FRAMES,
     MIN_BOOST_LENGTH,
-    TURN_SPEED,
     BASE_HEAD_RADIUS,
     BASE_SEGMENT_RADIUS,
     INITIAL_LENGTH,
     SEGMENT_SPAWN_INTERVAL,
-    SIZE_GROWTH_RATE,
-    MAX_SIZE_MULTIPLIER,
     MAX_FOOD,
     FOOD_SPAWN_CHANCE,
     COLORS,
@@ -38,7 +41,10 @@ import {
     ZOOM_SPEED,
 } from './constants';
 
-import { SnakeHead, SnakeSegment } from './entities';
+import { SnakeHead, SnakeSegment, DIR_SCALE } from './entities';
+
+// Fixed-point constants
+const TURN_SPEED_FP = toFixed(0.15);  // Turn speed as fixed-point
 
 // ============================================
 // Helper Functions
@@ -70,18 +76,27 @@ function compareStrings(a: string, b: string): number {
 }
 
 /**
- * Calculate size multiplier based on snake length
+ * Calculate size multiplier based on snake length.
+ * Returns a fixed-point value scaled by 100 (e.g., 100 = 1.0x, 150 = 1.5x, 300 = 3.0x).
+ * Uses integer math for determinism.
  */
 export function getSizeMultiplier(length: number): number {
-    const growth = 1 + (length - INITIAL_LENGTH) * SIZE_GROWTH_RATE;
-    return Math.min(growth, MAX_SIZE_MULTIPLIER);
+    // SIZE_GROWTH_RATE is 0.02, so multiply by 2 per length unit above INITIAL_LENGTH
+    // Base is 100 (representing 1.0x multiplier)
+    // Formula: 100 + (length - INITIAL_LENGTH) * 2
+    const growth = 100 + (length - INITIAL_LENGTH) * 2;
+    // MAX_SIZE_MULTIPLIER is 3, so cap at 300
+    const maxScaled = 300; // MAX_SIZE_MULTIPLIER * 100
+    return growth < maxScaled ? growth : maxScaled;
 }
 
 /**
- * Calculate target zoom based on snake length
+ * Calculate target zoom based on snake length.
+ * This is render-only (camera zoom), so float math is acceptable here.
  */
 export function getTargetZoom(length: number): number {
-    const sizeMultiplier = getSizeMultiplier(length);
+    // getSizeMultiplier returns scaled by 100, so divide by 100 to get actual multiplier
+    const sizeMultiplier = getSizeMultiplier(length) / 100;
     return Math.max(MIN_ZOOM, MAX_ZOOM / sizeMultiplier);
 }
 
@@ -188,25 +203,48 @@ export function setupSystems(game: Game): void {
             sh.prevDirY = sh.dirY;
 
             if (playerInput?.target) {
-                // Direction calculation - Math.sqrt auto-transforms to dSqrt
-                const dx = playerInput.target.x - t.x;
-                const dy = playerInput.target.y - t.y;
-                const distSq = dx * dx + dy * dy;
+                // === FULLY DETERMINISTIC DIRECTION CALCULATION ===
+                // Round input to integers first to ensure identical values on client/server
+                const targetX = Math.round(playerInput.target.x);
+                const targetY = Math.round(playerInput.target.y);
 
-                if (distSq > 1) {
-                    const dist = Math.sqrt(distSq);
-                    const desiredX = dx / dist;
-                    const desiredY = dy / dist;
+                // All math in fixed-point (16.16 format)
+                const dxFp = toFixed(targetX) - toFixed(t.x);
+                const dyFp = toFixed(targetY) - toFixed(t.y);
+                const distSqFp = fpMul(dxFp, dxFp) + fpMul(dyFp, dyFp);
 
-                    let newDirX = sh.dirX + (desiredX - sh.dirX) * TURN_SPEED;
-                    let newDirY = sh.dirY + (desiredY - sh.dirY) * TURN_SPEED;
+                // Only turn if target is far enough (> 1 unit)
+                if (distSqFp > FP_ONE) {
+                    const distFp = fpSqrt(distSqFp);
 
-                    const newLenSq = newDirX * newDirX + newDirY * newDirY;
-                    const newLen = Math.sqrt(newLenSq);
-                    if (newLen > 0.001) {
-                        sh.dirX = newDirX / newLen;
-                        sh.dirY = newDirY / newLen;
+                    // Desired direction (normalized, scaled by FP_ONE)
+                    const desiredXFp = fpDiv(dxFp, distFp);
+                    const desiredYFp = fpDiv(dyFp, distFp);
+
+                    // Current direction converted from DIR_SCALE to FP
+                    // sh.dirX is scaled by 1000, FP_ONE is 65536
+                    // To convert: (dirX * FP_ONE) / DIR_SCALE
+                    const curDirXFp = ((sh.dirX * FP_ONE) / DIR_SCALE) | 0;
+                    const curDirYFp = ((sh.dirY * FP_ONE) / DIR_SCALE) | 0;
+
+                    // Interpolate: newDir = curDir + (desired - curDir) * turnSpeed
+                    let newDirXFp = curDirXFp + fpMul(desiredXFp - curDirXFp, TURN_SPEED_FP);
+                    let newDirYFp = curDirYFp + fpMul(desiredYFp - curDirYFp, TURN_SPEED_FP);
+
+                    // Normalize the new direction
+                    const newLenSqFp = fpMul(newDirXFp, newDirXFp) + fpMul(newDirYFp, newDirYFp);
+                    if (newLenSqFp > 0) {
+                        const newLenFp = fpSqrt(newLenSqFp);
+                        if (newLenFp > 0) {
+                            newDirXFp = fpDiv(newDirXFp, newLenFp);
+                            newDirYFp = fpDiv(newDirYFp, newLenFp);
+                        }
                     }
+
+                    // Convert back to DIR_SCALE format for storage
+                    // (dirFp * DIR_SCALE) / FP_ONE
+                    sh.dirX = ((newDirXFp * DIR_SCALE) / FP_ONE) | 0;
+                    sh.dirY = ((newDirYFp * DIR_SCALE) / FP_ONE) | 0;
                 }
             }
 
@@ -221,9 +259,13 @@ export function setupSystems(game: Game): void {
                 if (sh.boostFrames >= BOOST_COST_FRAMES) {
                     sh.length--;
                     sh.boostFrames = 0;
+                    // Food spawn position using integer math
+                    // t.x - (dirX * 30) / DIR_SCALE
+                    const foodX = t.x - ((sh.dirX * 30) / DIR_SCALE) | 0;
+                    const foodY = t.y - ((sh.dirY * 30) / DIR_SCALE) | 0;
                     game.spawn('food', {
-                        x: (t.x - sh.dirX * 30) | 0,
-                        y: (t.y - sh.dirY * 30) | 0,
+                        x: foodX,
+                        y: foodY,
                         color: head.get(Sprite).color
                     });
                 }
@@ -231,15 +273,21 @@ export function setupSystems(game: Game): void {
                 sh.boostFrames = 0;
             }
 
-            // Use velocity-based movement (physics handles determinism)
-            const vx = sh.dirX * currentSpeed * 60;
-            const vy = sh.dirY * currentSpeed * 60;
-            head.setVelocity(vx, vy);
+            // === DETERMINISTIC VELOCITY ===
+            // Velocity = (direction / DIR_SCALE) * speed * 60
+            // Using integer math: (dirX * speed * 60) / DIR_SCALE
+            // But we need float output for physics, so convert at end
+            const vxInt = (sh.dirX * currentSpeed * 60) / DIR_SCALE;
+            const vyInt = (sh.dirY * currentSpeed * 60) / DIR_SCALE;
+            // Round to ensure determinism
+            head.setVelocity(Math.round(vxInt), Math.round(vyInt));
 
-            // Boundary check
-            const radius = head.get(Sprite).radius;
-            if (t.x - radius < 0 || t.x + radius > WORLD_WIDTH ||
-                t.y - radius < 0 || t.y + radius > WORLD_HEIGHT) {
+            // Boundary check (using integer comparison)
+            const radius = head.get(Sprite).radius | 0;
+            const posX = t.x | 0;
+            const posY = t.y | 0;
+            if (posX - radius < 0 || posX + radius > WORLD_WIDTH ||
+                posY - radius < 0 || posY + radius > WORLD_HEIGHT) {
                 killSnake(game, clientId);
                 continue; // Skip segment spawning for dead snake
             }
@@ -248,12 +296,15 @@ export function setupSystems(game: Game): void {
             const frameDiff = game.frame - sh.lastSpawnFrame;
             if (frameDiff >= SEGMENT_SPAWN_INTERVAL) {
                 const color = head.get(Sprite).color;
-                game.spawn('snake-segment', {
-                    x: t.x, y: t.y,
-                    color: color,
-                    ownerId: clientId,
-                    spawnFrame: game.frame
+                const seg = game.spawn('snake-segment', {
+                    x: posX,
+                    y: posY,
+                    color: color
                 });
+                // Manually set SnakeSegment fields to ensure they're applied
+                const segData = seg.get(SnakeSegment);
+                segData.ownerId = clientId;
+                segData.spawnFrame = game.frame;
                 sh.lastSpawnFrame = game.frame;
             }
         }
@@ -292,6 +343,8 @@ export function setupSystems(game: Game): void {
     }, { phase: 'update' });
 
     // Size update - process in deterministic order
+    // Uses integer math: getSizeMultiplier returns scale * 100, so we compute
+    // radius = (BASE_RADIUS * sizeMultScaled) / 100 using integer division
     game.addSystem(() => {
         const ownerLengths = new Map<number, number>();
 
@@ -301,10 +354,11 @@ export function setupSystems(game: Game): void {
             if (head.destroyed) continue;
             const clientId = head.get(Player).clientId;
             const length = head.get(SnakeHead).length;
-            const sizeMult = getSizeMultiplier(length);
-            ownerLengths.set(clientId, sizeMult);
+            const sizeMultScaled = getSizeMultiplier(length); // Returns 100-300 (scaled by 100)
+            ownerLengths.set(clientId, sizeMultScaled);
 
-            const headRadius = BASE_HEAD_RADIUS * sizeMult;
+            // Integer division: (16 * 150) / 100 = 24
+            const headRadius = ((BASE_HEAD_RADIUS * sizeMultScaled) / 100) | 0;
             head.get(Sprite).radius = headRadius;
             head.get(Body2D).radius = headRadius;
         }
@@ -314,8 +368,9 @@ export function setupSystems(game: Game): void {
         for (const seg of allSegments) {
             if (seg.destroyed) continue;
             const ownerId = seg.get(SnakeSegment).ownerId;
-            const sizeMult = ownerLengths.get(ownerId) || 1;
-            const segRadius = BASE_SEGMENT_RADIUS * sizeMult;
+            const sizeMultScaled = ownerLengths.get(ownerId) || 100; // Default to 100 (1.0x)
+            // Integer division: (14 * 150) / 100 = 21
+            const segRadius = ((BASE_SEGMENT_RADIUS * sizeMultScaled) / 100) | 0;
             seg.get(Sprite).radius = segRadius;
             seg.get(Body2D).radius = segRadius;
         }

@@ -20,7 +20,7 @@ import {
     WORLD_HEIGHT,
 } from './constants';
 
-import { SnakeHead } from './entities';
+import { SnakeHead, DIR_SCALE } from './entities';
 import { getSizeMultiplier, updateCamera } from './systems';
 import type { RankEntry } from './types';
 
@@ -44,10 +44,12 @@ export function createRenderer(
 ): () => void {
     const canvasCtx = renderer.context;
     const minimapCtx = minimapCanvas.getContext('2d')!;
-    const width = canvas.width;
-    const height = canvas.height;
 
     function renderWithCamera(): void {
+        // Read dimensions each frame to handle resize
+        const width = canvas.width;
+        const height = canvas.height;
+
         const cameraEntity = getCameraEntity();
         const alpha = game.getRenderAlpha();
         const camera = cameraEntity.get(Camera2D);
@@ -123,7 +125,8 @@ export function createRenderer(
             const y = head.render?.interpY ?? head.get(Transform2D).y;
             const sprite = head.get(Sprite);
             const sh = head.get(SnakeHead);
-            const sizeMult = getSizeMultiplier(sh.length);
+            // getSizeMultiplier returns scaled by 100, divide for render use
+            const sizeMult = getSizeMultiplier(sh.length) / 100;
             const colorStr = game.getString('color', sprite.color) || '#fff';
 
             // Glow when boosting
@@ -148,9 +151,10 @@ export function createRenderer(
             canvasCtx.arc(x, y, sprite.radius, 0, Math.PI * 2);
             canvasCtx.fill();
 
-            // Eyes
-            const dirX = sh.prevDirX + (sh.dirX - sh.prevDirX) * alpha;
-            const dirY = sh.prevDirY + (sh.dirY - sh.prevDirY) * alpha;
+            // Eyes (render-only, float math is fine)
+            // Direction values are scaled by DIR_SCALE, so divide for actual direction
+            const dirX = (sh.prevDirX + (sh.dirX - sh.prevDirX) * alpha) / DIR_SCALE;
+            const dirY = (sh.prevDirY + (sh.dirY - sh.prevDirY) * alpha) / DIR_SCALE;
             const eyeOffset = 6 * sizeMult;
             const eyeRadius = 5 * sizeMult;
             const pupilRadius = 2 * sizeMult;
@@ -171,7 +175,7 @@ export function createRenderer(
         }
 
         canvasCtx.restore();
-        drawMinimap(camera);
+        drawMinimap(camera, width, height);
         updateStats();
     }
 
@@ -203,7 +207,7 @@ export function createRenderer(
         statsRank.textContent = `${rank} of ${snakes.length}`;
     }
 
-    function drawMinimap(camera: { x: number; y: number; zoom: number }): void {
+    function drawMinimap(camera: { x: number; y: number; zoom: number }, width: number, height: number): void {
         const camX = camera.x;
         const camY = camera.y;
         const mmW = minimapCanvas.width;
